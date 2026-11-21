@@ -133,8 +133,16 @@ export interface ServingModel {
   selection_policy: string;
   classification_threshold: number;
   credit_score_formula: string;
-  cv_results: { models: Record<string, { summary: { ap_mean: number; ap_std: number; roc_auc_mean: number; roc_auc_std: number } }> };
-  test_metrics: Record<string, unknown>;
+  probability_calibrated: boolean;
+  cv_results: { models: Record<string, {
+    folds: { fold: number; ap: number }[];
+    summary: { ap_mean: number; ap_std: number; roc_auc_mean: number; roc_auc_std: number };
+    total_fit_seconds: number;
+  }> };
+  test_metrics: {
+    rows: number; ap: number; roc_auc: number; accuracy: number; precision: number; recall: number;
+    f1: number; confusion_matrix: number[][];
+  };
   risk_bands: { status: string };
 }
 
@@ -155,5 +163,6 @@ export interface HomeCreditPrediction {
   risk_level: string;
   imputed_features: string[];
   outcome_definition: string;
+  probability_calibrated: boolean;
   disclaimer: string;
 }

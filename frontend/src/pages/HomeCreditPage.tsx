@@ -1,10 +1,12 @@
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useCallback, useEffect, useState } from "react";
 import { api, errorMessage } from "../api/client";
 import { useToast } from "../components/Toast";
+import { ErrorState } from "../components/UI";
+import { useReadRequest } from "../hooks/useReadRequest";
 import type { HomeCreditContract, HomeCreditPrediction } from "../types";
 
 export function HomeCreditPage() {
-  const [contract, setContract] = useState<HomeCreditContract | null>(null);
+  const { data: contract, error, run } = useReadRequest<HomeCreditContract>();
   const [values, setValues] = useState<Record<string, string>>({});
   const [unknown, setUnknown] = useState<Record<string, boolean>>({});
   const [confirmed, setConfirmed] = useState(false);
@@ -12,9 +14,9 @@ export function HomeCreditPage() {
   const [busy, setBusy] = useState(false);
   const toast = useToast();
 
-  useEffect(() => {
-    api.get<HomeCreditContract>("/api/home-credit/input-schema").then(res => setContract(res.data)).catch(err => toast.error(errorMessage(err)));
-  }, [toast]);
+  const loadContract = useCallback(() => run(async (signal) =>
+    (await api.get<HomeCreditContract>("/api/home-credit/input-schema", { signal })).data), [run]);
+  useEffect(() => { void loadContract(); }, [loadContract]);
 
   async function loadSample() {
     try {
@@ -46,8 +48,8 @@ export function HomeCreditPage() {
   return <div className="space-y-4">
     <h2 className="text-2xl font-semibold">Home Credit — khó khăn thanh toán</h2>
     <p>Nhập hồ sơ theo định nghĩa Home Credit. Không tự chuyển dữ liệu vay mô phỏng, thu nhập tháng hoặc lịch sử trả nợ sang các trường này. Luồng demo này không ghi vào lịch sử hồ sơ mô phỏng cũ.</p>
-    <button className="btn-ghost" onClick={loadSample}>Nạp một hồ sơ mẫu từ Training</button>
-    {!contract ? <p>Đang tải hợp đồng đầu vào từ dịch vụ mô hình…</p> : <form onSubmit={submit} className="card space-y-4">
+    <button className="btn-ghost" onClick={loadSample} disabled={!contract}>Nạp một hồ sơ mẫu từ Training</button>
+    {error ? <ErrorState message={error} retry={loadContract} /> : !contract ? <p>Đang tải hợp đồng đầu vào từ dịch vụ mô hình…</p> : <form onSubmit={submit} className="card space-y-4">
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
         {Object.entries(contract.features).map(([name, spec]) => <div key={name} className="space-y-1">
           <label className="block font-medium" htmlFor={name}>{spec.label} ({name})</label>
@@ -64,7 +66,8 @@ export function HomeCreditPage() {
     {result && <div className="card space-y-2" aria-live="polite">
       <p className="text-xl font-medium">Ước lượng TARGET=1: {(100 * result.payment_difficulty_probability).toFixed(2)}%</p>
       <p>Lớp dự đoán ở ngưỡng {result.classification_threshold}: {result.predicted_payment_difficulty ? "Gặp khó khăn thanh toán" : "Các trường hợp còn lại"}.</p>
-      <p>TARGET=1: trễ hơn X ngày ở ít nhất một trong Y kỳ trả đầu tiên (Home Credit không công bố X/Y). Xác suất chưa được hiệu chỉnh.</p>
+      <p>TARGET=1 biểu thị trễ hơn X ngày ở ít nhất một trong Y kỳ trả đầu tiên (Home Credit không công bố X/Y).
+        {result.probability_calibrated ? " Xác suất đã hiệu chỉnh trên Training." : " Xác suất chưa được hiệu chỉnh."}</p>
       <p>Chưa gán nhóm thấp/trung bình/cao vì ngưỡng cũ chưa được xác nhận cho mô hình này.</p>
       <p>Điểm hồ sơ minh họa: {result.credit_score.toFixed(2)} — không phải điểm dùng để chọn thuật toán.</p>
       <p>Nguồn: {result.data_source} · {result.algorithm} · {result.model_version}</p>

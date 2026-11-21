@@ -7,7 +7,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    artifact_dir: str = str(Path(__file__).resolve().parents[1] / "artifacts")
+    artifact_dir: str = str(Path(__file__).resolve().parents[2] / "reports" / "ml-artifacts")
+    ml_training_token: str = ""
     # Versioned manifest is the sole serving source. Legacy risk-band environment
     # variables are ignored; Home Credit bands remain disabled pending validation.
 

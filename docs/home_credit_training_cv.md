@@ -1,5 +1,7 @@
 # Prompt 2: so sánh mô hình bằng CV trên Training
 
+Tài liệu lịch sử của bản v1. Quy trình và cấu hình hiện hành có trong [báo cáo huấn luyện lại](ml_retraining_report.md).
+
 > Đây là ghi nhận lịch sử Prompt 2. Prompt 3 đã chốt AP → ROC-AUC → thứ tự ứng viên,
 > chạy đánh giá thật và tích hợp phục vụ; xem [bản phát hành Home Credit](home_credit_release.md).
 

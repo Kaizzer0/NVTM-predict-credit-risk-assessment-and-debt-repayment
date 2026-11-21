@@ -36,13 +36,13 @@ def decimal_safe(value) -> Decimal:
     return Decimal(str(round(float(value), 6)))
 
 
-def request_home_credit(method: str, path: str, payload: dict | None = None) -> dict:
+def request_home_credit(method: str, path: str, payload: dict | None = None, *, headers=None) -> dict:
     """Forward the canonical ML contract unchanged; never build fake legacy inputs."""
     from fastapi import HTTPException
 
     try:
         with httpx.Client(timeout=60.0) as client:
-            response = client.request(method, f"{get_settings().ml_service_url}{path}", json=payload)
+            response = client.request(method, f"{get_settings().ml_service_url}{path}", json=payload, headers=headers)
     except httpx.RequestError as exc:
         raise AppError(f"Không kết nối được Home Credit ML Service: {exc}", 503, "ML_UNAVAILABLE") from exc
     if response.status_code >= 400:

@@ -1,5 +1,13 @@
 # Optional, one-shot preparation service. Does not mount serving artifacts.
 services:
+  ml-service:
+    environment:
+      HOME_CREDIT_DATA_DIR: /datasets/home-credit-default-risk
+    volumes:
+      - type: bind
+        source: ${HOME_CREDIT_DATA_DIR:-../home-credit-default-risk}
+        target: /datasets/home-credit-default-risk
+        read_only: true
   home-credit-prepare:
     profiles: ["prepare"]
     build:

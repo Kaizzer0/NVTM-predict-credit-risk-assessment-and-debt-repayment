@@ -4,7 +4,7 @@ import pandas as pd
 import pytest
 
 from app.home_credit_features import FEATURES, build_preprocessor, validate_features
-from training.train import load_home_credit, resolve_csv, train_and_export
+from training.train import load_home_credit, resolve_csv
 
 
 def inputs():
@@ -77,20 +77,16 @@ def test_loader_rejects_corrupted_csv(tmp_path, problem):
         load_home_credit(data_dir=tmp_path)
 
 
-def test_export_is_disabled(tmp_path):
-    with pytest.raises(RuntimeError, match="disabled"):
-        train_and_export(tmp_path)
-    assert list(tmp_path.iterdir()) == []
-
-
 def test_serving_does_not_train_when_artifact_is_missing(tmp_path, monkeypatch):
     from types import SimpleNamespace
+    from fastapi.testclient import TestClient
     from app import scoring
+    from app.main import app
 
-    monkeypatch.setattr(scoring, "_PIPELINE", None)
-    monkeypatch.setattr(scoring, "get_settings", lambda: SimpleNamespace(
-        artifact_dir=tmp_path,
-    ))
-    with pytest.raises(FileNotFoundError, match="No validated active Home Credit"):
-        scoring._ensure_loaded()
+    monkeypatch.setattr(scoring, "get_settings", lambda: SimpleNamespace(artifact_dir=tmp_path))
+    with TestClient(app) as client:
+        assert client.get("/health").json()["model_ready"] is False
+        assert client.get("/model/info").status_code == 503
+        sample = inputs().iloc[0].to_dict()
+        assert client.post("/predict", json={**sample, "amount_unit": "HOME_CREDIT_SOURCE"}).status_code == 503
     assert list(tmp_path.iterdir()) == []

@@ -14,7 +14,7 @@ export interface CasePrediction {
   risk_level: string;
   credit_score: number;
   created_at: string;
-  response_json: { imputed_features: string[]; disclaimer: string; explanation_note: string };
+  response_json: { imputed_features: string[]; disclaimer: string; explanation_note: string; probability_calibrated?: boolean };
   display_name?: string;
   source_application_id?: number;
 }

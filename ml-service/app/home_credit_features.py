@@ -1,9 +1,4 @@
-"""Home Credit v1 input contract, shared by offline preparation and future inference.
-
-This contract is NOT the active synthetic PredictRequest. Monetary amounts keep
-the source scale: neither currency conversion nor income-period conversion is
-justified by HomeCredit_columns_description.csv.
-"""
+"""Shared Home Credit training and inference contract. Amounts keep the source scale."""
 from __future__ import annotations
 
 import numpy as np
@@ -89,18 +84,18 @@ class CleanHomeCredit(BaseEstimator, TransformerMixin):
         result = X.loc[:, FEATURES].copy()
         result["DAYS_EMPLOYED"] = result["DAYS_EMPLOYED"].replace(365243, np.nan)
         for name in CATEGORICAL:
-            result[name] = result[name].astype(object).replace(list(SPECIAL_CATEGORIES), np.nan)
-            result[name] = result[name].where(result[name].notna(), np.nan)
+            values = result[name].astype(object)
+            result[name] = values.where(values.notna() & ~values.isin(SPECIAL_CATEGORIES), np.nan)
         return result
 
     def get_feature_names_out(self, input_features=None):
         return np.asarray(FEATURES, dtype=object)
 
 
-def build_preprocessor() -> Pipeline:
+def build_preprocessor(*, scale_numeric=True) -> Pipeline:
     numeric = Pipeline([
         ("imputer", SimpleImputer(strategy="median", keep_empty_features=True)),
-        ("scaler", StandardScaler()),
+        ("scaler", StandardScaler() if scale_numeric else "passthrough"),
     ])
     categorical = Pipeline([
         ("imputer", SimpleImputer(strategy="constant", fill_value="__MISSING__", keep_empty_features=True)),
@@ -111,5 +106,5 @@ def build_preprocessor() -> Pipeline:
         ("columns", ColumnTransformer([
             ("num", numeric, NUMERIC),
             ("cat", categorical, CATEGORICAL),
-        ], remainder="drop")),
+        ], remainder="drop", sparse_threshold=1.0)),
     ])

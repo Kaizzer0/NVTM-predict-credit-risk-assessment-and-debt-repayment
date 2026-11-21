@@ -11,6 +11,8 @@ import hashlib
 import json
 import os
 import sys
+from time import perf_counter
+import warnings
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,20 +21,43 @@ if str(ROOT) not in sys.path:
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import average_precision_score, roc_auc_score, precision_score, recall_score, f1_score, confusion_matrix
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.exceptions import ConvergenceWarning
+from sklearn.metrics import (
+    accuracy_score, average_precision_score, confusion_matrix, f1_score,
+    precision_recall_curve, precision_score, recall_score, roc_auc_score, roc_curve,
+)
 from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import Pipeline
+from sklearn.svm import LinearSVC
+from sklearn.tree import DecisionTreeClassifier
+from threadpoolctl import threadpool_limits
 
+from app.config import get_settings
 from app.home_credit_features import (
     CATEGORICAL, CONTRACT_VERSION, DATASET, FEATURES, FEATURE_SPEC, ID_COLUMN, NUMERIC,
     SPECIAL_CATEGORIES, TARGET, TARGET_MEANING, build_preprocessor, validate_features,
 )
 
-MODEL_NAMES = ("LogisticRegression", "RandomForest", "XGBoost")
+MODEL_NAMES = ("DecisionTree", "LinearSVM", "ANN")
+CONFIGURATIONS = {
+    "DecisionTree": [
+        {"max_depth": 5, "min_samples_split": 800, "min_samples_leaf": 400, "class_weight": "balanced"},
+        {"max_depth": 8, "min_samples_split": 400, "min_samples_leaf": 200, "class_weight": "balanced"},
+    ],
+    "LinearSVM": [
+        {"C": 0.01, "class_weight": "balanced"},
+        {"C": 1.0, "class_weight": "balanced"},
+    ],
+    "ANN": [
+        {"hidden_layer_sizes": (16,), "alpha": 0.001},
+        {"hidden_layer_sizes": (24, 12), "alpha": 0.01},
+    ],
+}
 CLASSIFICATION_THRESHOLD = 0.5  # Fixed before any Test evaluation; no Test tuning.
-SELECTION_POLICY = "max CV mean AP; exact tie: max CV mean ROC-AUC; exact tie: LogisticRegression, RandomForest, XGBoost"
+SELECTION_POLICY = "max CV mean AP; exact ties use candidate order (DecisionTree, LinearSVM, ANN)"
+CALIBRATION = {"method": "sigmoid", "n_splits": 3, "random_state": 42, "ensemble": False}
 
 
 @dataclass(frozen=True)
@@ -51,10 +76,12 @@ class HeldOutTest:
 
 @dataclass(frozen=True)
 class RefitModel:
-    pipeline: Pipeline
+    pipeline: CalibratedClassifierCV
     model_name: str
     training_record_ids: np.ndarray
     profile: str
+    fit_seconds: float
+    convergence_warnings: list[str]
 
 
 def split_training_test(frame: pd.DataFrame) -> tuple[TrainingData, HeldOutTest]:
@@ -74,9 +101,9 @@ def split_training_test(frame: pd.DataFrame) -> tuple[TrainingData, HeldOutTest]
 
     def partition(kind, rows):
         return kind(
-            x=frame.iloc[rows].loc[:, FEATURES].copy(),
-            y=frame.iloc[rows][TARGET].astype(int).copy(),
-            record_ids=frame.iloc[rows][ID_COLUMN].to_numpy(copy=True),
+            x=frame.loc[:, FEATURES].iloc[rows],
+            y=frame[TARGET].iloc[rows].astype(int),
+            record_ids=frame[ID_COLUMN].iloc[rows].to_numpy(copy=True),
         )
 
     return partition(TrainingData, train_pos), partition(HeldOutTest, test_pos)
@@ -97,46 +124,43 @@ def _validate_training(training: TrainingData, min_per_class: int = 1) -> None:
         raise ValueError(f"Training needs both labels and at least {min_per_class} rows per class")
 
 
-def _positive_weight(y: pd.Series) -> float:
-    positive = int(y.eq(1).sum())
-    negative = int(y.eq(0).sum())
-    if min(positive, negative) == 0:
-        raise ValueError("Both classes are required to calculate scale_pos_weight")
-    return negative / positive
-
-
-def make_model(name: str, y_fit: pd.Series, *, profile: str = "standard"):
-    """Fixed configurations, no Test tuning. Smoke profile is test-only."""
+def make_model(name: str, *, profile: str = "standard", candidate: int = 0):
     if profile not in {"standard", "smoke"}:
         raise ValueError(f"Unknown model profile: {profile}")
-    if name == "LogisticRegression":
-        return LogisticRegression(max_iter=400, class_weight="balanced", solver="lbfgs")
-    if name == "RandomForest":
-        return RandomForestClassifier(
-            n_estimators=8 if profile == "smoke" else 120,
-            max_depth=3 if profile == "smoke" else 10,
-            min_samples_leaf=4, class_weight="balanced", random_state=42,
-            n_jobs=1 if profile == "smoke" else -1,
-        )
-    if name == "XGBoost":
-        # Lazy import keeps CSV preparation usable without XGBoost installed.
-        from xgboost import XGBClassifier
-
-        return XGBClassifier(
-            n_estimators=8 if profile == "smoke" else 160,
-            max_depth=2 if profile == "smoke" else 5,
-            learning_rate=0.08, subsample=0.9, colsample_bytree=0.9,
-            scale_pos_weight=_positive_weight(y_fit), eval_metric="logloss",
-            random_state=42, n_jobs=1 if profile == "smoke" else -1,
+    params = CONFIGURATIONS[name][candidate].copy()
+    if name == "DecisionTree":
+        if profile == "smoke":
+            params.update(min_samples_split=10, min_samples_leaf=5)
+        return DecisionTreeClassifier(random_state=42, **params)
+    if name == "LinearSVM":
+        return LinearSVC(dual=False, tol=1e-5, max_iter=2000, random_state=42, **params)
+    if name == "ANN":
+        return MLPClassifier(
+            activation="relu", solver="adam", batch_size=32 if profile == "smoke" else 256, random_state=42,
+            max_iter=8 if profile == "smoke" else 60, tol=1e-4, n_iter_no_change=7, **params,
         )
     raise ValueError(f"Unknown model: {name}")
 
 
-def _new_pipeline(name: str, y_fit: pd.Series, *, profile: str) -> Pipeline:
+def _new_pipeline(name: str, *, profile: str, candidate: int) -> Pipeline:
     return Pipeline([
-        ("preprocess", build_preprocessor()),
-        ("model", make_model(name, y_fit, profile=profile)),
+        ("preprocess", build_preprocessor(scale_numeric=name != "DecisionTree")),
+        ("model", make_model(name, profile=profile, candidate=candidate)),
     ])
+
+
+def _fit(estimator, x, y) -> tuple[float, list[str]]:
+    started = perf_counter()
+    with threadpool_limits(limits=2), warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always", ConvergenceWarning)
+        estimator.fit(x, y)
+    convergence = []
+    for warning in recorded:
+        if issubclass(warning.category, ConvergenceWarning):
+            convergence.append(str(warning.message))
+        else:
+            warnings.warn_explicit(warning.message, warning.category, warning.filename, warning.lineno)
+    return perf_counter() - started, convergence
 
 
 def _partition_digest(record_ids) -> str:
@@ -151,104 +175,101 @@ def probability_metrics(y_true, probabilities) -> dict:
     }
 
 
-def compare_on_training(training: TrainingData, *, profile: str = "standard", oof_predictions=None) -> dict:
-    """Stage 1: five-fold comparison and AP-only winner selection; no Test input."""
+def compare_on_training(training: TrainingData, *, profile: str = "standard", progress=None) -> dict:
+    """Compare candidate configurations on the same five Training folds."""
     _validate_training(training, min_per_class=5)
+    started = perf_counter()
     splitter = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    # Materialize ONCE: every model uses these exact same positional indices.
-    splits = tuple(splitter.split(training.x, training.y))
+    splits = [
+        (fit, valid, _partition_digest(training.record_ids[fit]), _partition_digest(training.record_ids[valid]))
+        for fit, valid in splitter.split(training.x, training.y)
+    ]
     results = {}
     for name in MODEL_NAMES:
-        folds = []
-        oof = np.full(len(training.y), np.nan)
-        for fold_number, (fit_pos, valid_pos) in enumerate(splits, start=1):
-            x_fit, y_fit = training.x.iloc[fit_pos], training.y.iloc[fit_pos]
-            x_valid, y_valid = training.x.iloc[valid_pos], training.y.iloc[valid_pos]
-            # A NEW preprocessor and classifier for every model/fold.
-            pipe = _new_pipeline(name, y_fit, profile=profile)
-            pipe.fit(x_fit, y_fit)
-            probabilities = pipe.predict_proba(x_valid)[:, 1]
-            oof[valid_pos] = probabilities
-            print(f"CV {name} fold {fold_number}/5 complete", file=sys.stderr, flush=True)
-            folds.append({
-                "fold": fold_number,
-                "fit_rows": len(fit_pos), "validation_rows": len(valid_pos),
-                "fit_ids_sha256": _partition_digest(training.record_ids[fit_pos]),
-                "validation_ids_sha256": _partition_digest(training.record_ids[valid_pos]),
-                "fit_class_counts": {str(label): int(y_fit.eq(label).sum()) for label in (0, 1)},
-                "scale_pos_weight": _positive_weight(y_fit) if name == "XGBoost" else None,
-                **probability_metrics(y_valid, probabilities),
+        candidates = []
+        count = len(CONFIGURATIONS[name]) if profile == "standard" else 1
+        for candidate in range(count):
+            folds = []
+            for fold, (fit_pos, valid_pos, fit_digest, valid_digest) in enumerate(splits, start=1):
+                x_fit, y_fit = training.x.iloc[fit_pos], training.y.iloc[fit_pos]
+                x_valid, y_valid = training.x.iloc[valid_pos], training.y.iloc[valid_pos]
+                pipe = _new_pipeline(name, profile=profile, candidate=candidate)
+                seconds, convergence = _fit(pipe, x_fit, y_fit)
+                scores = pipe.decision_function(x_valid) if name == "LinearSVM" else pipe.predict_proba(x_valid)[:, 1]
+                folds.append({
+                    "fold": fold, "fit_rows": len(fit_pos), "validation_rows": len(valid_pos),
+                    "fit_ids_sha256": fit_digest, "validation_ids_sha256": valid_digest,
+                    "fit_seconds": seconds, "convergence_warnings": convergence,
+                    **probability_metrics(y_valid, scores),
+                })
+                message = f"CV {name} config {candidate + 1}/{count} fold {fold}/5 AP={folds[-1]['ap']:.6f}"
+                print(message, file=sys.stderr, flush=True)
+                if progress:
+                    progress(message)
+            candidates.append({
+                "candidate": candidate, "parameters": pipe.named_steps["model"].get_params(),
+                "score_type": "decision_function" if name == "LinearSVM" else "predict_proba",
+                "folds": folds,
+                "fit_seconds": sum(fold["fit_seconds"] for fold in folds),
+                "summary": {
+                    f"{metric}_{stat}": float(operation([fold[metric] for fold in folds]))
+                    for metric in ("ap", "roc_auc")
+                    for stat, operation in (("mean", np.mean), ("std", np.std))
+                },
             })
-        summary = {
-            f"{metric}_{stat}": float(operation([fold[metric] for fold in folds]))
-            for metric in ("ap", "roc_auc")
-            for stat, operation in (("mean", np.mean), ("std", np.std))
-        }
+        best = max(candidates, key=lambda result: result["summary"]["ap_mean"])
         results[name] = {
-            "folds": folds,
-            "summary": summary,
-            "selection_inputs": summary.copy(),
+            **best, "configurations": candidates,
+            "total_fit_seconds": sum(result["fit_seconds"] for result in candidates),
         }
-        if oof_predictions is not None:
-            oof_predictions[name] = oof
     return {
-        "dataset": DATASET,
-        "contract_version": CONTRACT_VERSION,
-        "profile": profile,
-        "training_rows": len(training.x),
-        "training_ids_sha256": _partition_digest(training.record_ids),
+        "dataset": DATASET, "contract_version": CONTRACT_VERSION, "profile": profile,
+        "training_rows": len(training.x), "training_ids_sha256": _partition_digest(training.record_ids),
         "cv": {"n_splits": 5, "shuffle": True, "random_state": 42, "std_ddof": 0},
-        "models": results,
-        "selection_policy": SELECTION_POLICY,
-        "selected_model": select_model(results),
-        "test_evaluated": False,
-        "model_exported": False,
+        "models": results, "elapsed_seconds": perf_counter() - started,
+        "selection_policy": SELECTION_POLICY, "selected_model": select_model(results),
+        "test_evaluated": False, "model_exported": False,
     }
 
 
 def select_model(results: dict) -> str:
     if set(results) != set(MODEL_NAMES):
-        raise ValueError("Selection requires CV results for all three fixed candidates")
-    for name in MODEL_NAMES:
-        summary = results[name]["summary"]
-        if not np.isfinite([summary["ap_mean"], summary["roc_auc_mean"]]).all():
-            raise ValueError("Selection metrics must be finite")
-    # max returns the first candidate on an exact double tie, independent of dict order.
-    return max(MODEL_NAMES, key=lambda name: (
-        results[name]["summary"]["ap_mean"], results[name]["summary"]["roc_auc_mean"],
-    ))
+        raise ValueError("Selection requires CV results for all three algorithms")
+    scores = {name: results[name]["summary"]["ap_mean"] for name in MODEL_NAMES}
+    if not np.isfinite(list(scores.values())).all():
+        raise ValueError("Mean AP must be finite")
+    return max(scores, key=scores.__getitem__)
 
 
 def refit_selected_on_training(
-    training: TrainingData, selected_name: str, *, profile: str = "standard",
+    training: TrainingData, selected_name: str, *, profile: str = "standard", candidate: int = 0,
 ) -> RefitModel:
-    """Stage 2: fresh Pipeline fit on all Training after an external CV-only choice.
+    """Fit out-of-fold sigmoid calibration, then a fresh base pipeline on all Training."""
+    _validate_training(training, min_per_class=CALIBRATION["n_splits"])
+    pipe = _new_pipeline(selected_name, profile=profile, candidate=candidate)
+    cv = StratifiedKFold(n_splits=CALIBRATION["n_splits"], shuffle=True, random_state=42)
+    calibrated = CalibratedClassifierCV(pipe, method="sigmoid", cv=cv, ensemble=False, n_jobs=1)
+    seconds, convergence = _fit(calibrated, training.x, training.y)
+    return RefitModel(calibrated, selected_name, training.record_ids.copy(), profile, seconds, convergence)
 
-    This stage receives no Test data.
-    """
-    _validate_training(training)
-    pipe = _new_pipeline(selected_name, training.y, profile=profile)
-    pipe.fit(training.x, training.y)
-    return RefitModel(pipe, selected_name, training.record_ids.copy(), profile)
 
-
-def evaluate_on_test(fitted: RefitModel, test: HeldOutTest, *, threshold=CLASSIFICATION_THRESHOLD) -> dict:
-    """Stage 3: called once by train_version AFTER selection lock and refit.
-
-    No parameter, feature, preprocessing or threshold selection happens here.
-    Unit tests use a tiny artificial holdout; inference never calls this function.
-    """
+def evaluate_on_test(fitted: RefitModel, test: HeldOutTest, *, threshold=CLASSIFICATION_THRESHOLD, curves=None) -> dict:
+    """Evaluate the frozen classifier on its independent holdout."""
     if not isinstance(test, HeldOutTest):
         raise TypeError("Evaluation requires a separate HeldOutTest partition")
     if np.intersect1d(fitted.training_record_ids, test.record_ids).size:
         raise ValueError("Test IDs overlap the refit Training partition")
     probabilities = fitted.pipeline.predict_proba(test.x)[:, 1]
-    labels = (probabilities >= threshold).astype(int)
+    labels = probabilities >= threshold
+    if curves is not None:
+        precision, recall, _ = precision_recall_curve(test.y, probabilities)
+        fpr, tpr, _ = roc_curve(test.y, probabilities)
+        curves.update(pr={"recall": recall.tolist(), "precision": precision.tolist()},
+                      roc={"fpr": fpr.tolist(), "tpr": tpr.tolist()})
     return {
-        "model": fitted.model_name,
-        "rows": len(test.x),
+        "model": fitted.model_name, "rows": len(test.x),
         **probability_metrics(test.y, probabilities),
-        "threshold": threshold,
+        "threshold": threshold, "accuracy": float(accuracy_score(test.y, labels)),
         "precision": float(precision_score(test.y, labels, zero_division=0)),
         "recall": float(recall_score(test.y, labels, zero_division=0)),
         "f1": float(f1_score(test.y, labels, zero_division=0)),
@@ -286,7 +307,7 @@ def resolve_csv(explicit, env_name: str, filename: str, data_dir=None) -> Path:
     )
 
 
-def load_home_credit(application_csv=None, description_csv=None, data_dir=None):
+def load_home_credit(application_csv=None, description_csv=None, data_dir=None, *, full_audit=True):
     application_path = resolve_csv(application_csv, "HOME_CREDIT_APPLICATION_CSV", "application_train.csv", data_dir)
     # A supplied application path also locates its adjacent dictionary by default.
     dictionary_dir = data_dir
@@ -295,13 +316,13 @@ def load_home_credit(application_csv=None, description_csv=None, data_dir=None):
     description_path = resolve_csv(description_csv, "HOME_CREDIT_DESCRIPTION_CSV", "HomeCredit_columns_description.csv", dictionary_dir)
     if application_path.name.lower() != "application_train.csv":
         raise ValueError("This preparation step only accepts labeled application_train.csv")
+    required = [ID_COLUMN, TARGET, *FEATURES, "AMT_INCOME_TOTAL"]
     try:
-        frame = pd.read_csv(application_path)
+        frame = pd.read_csv(application_path, usecols=None if full_audit else required)
         # The official description file contains non-UTF8 bytes (e.g. accented words).
         descriptions = pd.read_csv(description_path, encoding="cp1252")
     except (ValueError, OSError, UnicodeError) as exc:
         raise ValueError(f"Could not read Home Credit CSVs ({application_path}, {description_path}): {exc}") from exc
-    required = [ID_COLUMN, TARGET, *FEATURES, "AMT_INCOME_TOTAL"]
     missing = sorted(set(required) - set(frame.columns))
     if missing:
         raise ValueError(f"application_train.csv is missing required columns: {missing}")
@@ -326,6 +347,7 @@ def audit_dataset(frame, dictionary, application_path, description_path) -> dict
         if any(counts.values()):
             special[name] = {key: count for key, count in counts.items() if count}
     definitions = dictionary.set_index("Row")["Description"].to_dict()
+    missing = frame.isna().sum()
     return {
         "dataset": DATASET,
         "contract_version": CONTRACT_VERSION,
@@ -337,15 +359,16 @@ def audit_dataset(frame, dictionary, application_path, description_path) -> dict
         "target_rates": {str(key): float(count) for key, count in frame[TARGET].value_counts(normalize=True).sort_index().items()},
         "duplicate_ids": int(frame[ID_COLUMN].duplicated().sum()),
         "missing_ids": int(frame[ID_COLUMN].isna().sum()),
-        "missing_cells": int(frame.isna().sum().sum()),
-        "columns_with_missing": int(frame.isna().any().sum()),
-        "missing_by_column": {name: int(value) for name, value in frame.isna().sum().items()},
+        "missing_cells": int(missing.sum()),
+        "columns_with_missing": int(missing.gt(0).sum()),
+        "missing_by_column": {name: int(value) for name, value in missing.items()},
+        "dtypes": {name: str(dtype) for name, dtype in frame.dtypes.items()},
         "special_categories": special,
         "days_employed_365243": int(frame["DAYS_EMPLOYED"].eq(365243).sum()),
         "positive_relative_days": {
             name: int((frame[name] > 0).sum()) for name in frame if name.startswith("DAYS_")
         },
-        "infinite_numeric_values": int(np.isinf(frame.select_dtypes(include="number").to_numpy()).sum()),
+        "infinite_numeric_values": sum(int(np.isinf(frame[name]).sum()) for name in frame if pd.api.types.is_numeric_dtype(frame[name])),
         "nonpositive_amounts": {
             name: int((frame[name] <= 0).sum()) for name in ("AMT_CREDIT", "AMT_INCOME_TOTAL", "AMT_ANNUITY")
         },
@@ -368,8 +391,7 @@ def smoke_pipeline(frame: pd.DataFrame, sample_size: int = 256) -> dict:
     transformed_train = preprocessor.fit_transform(train.loc[:, FEATURES], train[TARGET])
     transformed_valid = preprocessor.transform(valid.loc[:, FEATURES])
     for values in (transformed_train, transformed_valid):
-        dense = values.toarray() if hasattr(values, "toarray") else values
-        if not np.isfinite(dense).all():
+        if not np.isfinite(values.data if hasattr(values, "tocsr") else values).all():
             raise ValueError("Pipeline produced non-finite values")
     return {
         "sample_rows": len(sample), "fit_rows": len(train), "transform_rows": len(valid),
@@ -379,47 +401,7 @@ def smoke_pipeline(frame: pd.DataFrame, sample_size: int = 256) -> dict:
     }
 
 
-def make_smoke_frame(n: int = 150) -> pd.DataFrame:
-    """Artificial data ONLY for executable CV checks, never a CSV error fallback."""
-    if n < 50:
-        raise ValueError("CV smoke requires at least 50 artificial rows")
-    rng = np.random.default_rng(42)
-    target = (np.arange(n) % 5 == 0).astype(int)
-    annuity = rng.uniform(500, 5000, n)
-    annuity[::11] = np.nan
-    employed = -rng.integers(0, 10000, n)
-    employed[::13] = 365243
-    return pd.DataFrame({
-        ID_COLUMN: np.arange(100000, 100000 + n), TARGET: target,
-        "AMT_CREDIT": rng.uniform(50000, 500000, n),
-        "AMT_ANNUITY": annuity,
-        "DAYS_BIRTH": -rng.integers(7000, 25000, n),
-        "DAYS_EMPLOYED": employed,
-        "NAME_CONTRACT_TYPE": rng.choice(["Cash loans", "Revolving loans"], n),
-        "OCCUPATION_TYPE": rng.choice(["Laborers", "Managers", None], n),
-    })
-
-
-def run_cv_smoke(sample_size: int = 150) -> dict:
-    training, test = split_training_test(make_smoke_frame(sample_size))
-    report = compare_on_training(training, profile="smoke")
-    report["dataset"] = "artificial_home_credit_contract_fixture_NOT_REAL_CSV"
-    report["input_rows"] = sample_size
-    report["held_out_rows"] = len(test.record_ids)
-    report["refit_performed"] = False
-    # HeldOutTest is neither passed to comparison nor evaluated.
-    return report
-
-
-def train_and_export(*args, **kwargs):
-    raise RuntimeError(
-        "Compatibility auto-training entrypoint is disabled. "
-        "Use training/train.py --mode train --version NEW_VERSION for staged export, "
-        "then training.activate after reload/API verification. Never train at serving startup."
-    )
-
-
-def train_version(frame, version: str, artifact_root=ROOT / "artifacts", *, partitions=None) -> dict:
+def train_version(frame, version: str, artifact_root=None, *, partitions=None, progress=None) -> dict:
     """Full run: lock CV choice/threshold, refit Training, evaluate Test ONCE.
 
     A new version directory is mandatory; existing versions are never overwritten.
@@ -427,38 +409,33 @@ def train_version(frame, version: str, artifact_root=ROOT / "artifacts", *, part
     """
     import joblib
     import sklearn
-    import xgboost
     import re
 
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", version):
         raise ValueError("Version must contain only letters, digits, dots, hyphens or underscores")
-    destination = Path(artifact_root) / "versions" / version
+    destination = Path(artifact_root or get_settings().artifact_dir) / "versions" / version
     destination.mkdir(parents=True, exist_ok=False)
     training, test = partitions if partitions is not None else split_training_test(frame)
-    oof = {}
-    cv = compare_on_training(training, oof_predictions=oof)
+    cv = compare_on_training(training, progress=progress)
     selected = cv["selected_model"]
-    risk_review = {
-        "status": "disabled_pending_calibration",
-        "reason": "Legacy 0.20/0.45 bands were synthetic; OOF review alone does not validate business risk bands or calibrate balanced-class model probabilities.",
-        "source": "Training out-of-fold predictions only",
-        "legacy_thresholds": [0.2, 0.45],
-        "oof_checks": [{
-            "threshold": cutoff,
-            "predicted_positive_rows": int((oof[selected] >= cutoff).sum()),
-            "precision": float(precision_score(training.y, oof[selected] >= cutoff, zero_division=0)),
-            "recall": float(recall_score(training.y, oof[selected] >= cutoff, zero_division=0)),
-        } for cutoff in (0.2, 0.45)],
-    }
+    best = cv["models"][selected]
+    risk_review = {"status": "not_validated", "reason": "Business risk bands require separate outcome validation."}
     lock = {"cv": cv, "selected_model": selected, "classification_threshold": CLASSIFICATION_THRESHOLD,
-            "threshold_policy": "fixed_0.5_before_test", "risk_bands": risk_review}
+            "threshold_policy": "fixed_0.5_before_test", "probability_calibration": CALIBRATION}
     (destination / "selection_lock.json").write_text(json.dumps(lock, indent=2), encoding="utf-8")
-    print(f"Selection locked: {selected}; threshold=0.5. Refitting Training only.", file=sys.stderr, flush=True)
-    fitted = refit_selected_on_training(training, selected)
-    joblib.dump(fitted.pipeline, destination / "credit_pipeline.joblib")
-    # Persist state BEFORE the only Test predict/metric call. Never tune from its results.
+    message = f"Selection locked: {selected}; threshold=0.5. Refitting Training only."
+    print(message, file=sys.stderr, flush=True)
+    if progress:
+        progress(message)
+    fitted = refit_selected_on_training(training, selected, candidate=best["candidate"])
+    binary = destination / "credit_pipeline.joblib"
+    joblib.dump(fitted.pipeline, binary)
+    if progress:
+        progress("Evaluating the selected model on independent Test")
     (destination / "test_evaluation_started.txt").write_text(datetime.now(timezone.utc).isoformat(), encoding="utf-8")
-    test_metrics = evaluate_on_test(fitted, test)
+    curves = {}
+    test_metrics = evaluate_on_test(fitted, test, curves=curves)
+    (destination / "test_curves.json").write_text(json.dumps(curves, separators=(",", ":")), encoding="utf-8")
     print("Independent Test evaluated once.", file=sys.stderr, flush=True)
     sample = training.x.iloc[0].astype(object).where(training.x.iloc[0].notna(), None).to_dict()
     sample["amount_unit"] = "HOME_CREDIT_SOURCE"
@@ -473,12 +450,24 @@ def train_version(frame, version: str, artifact_root=ROOT / "artifacts", *, part
         "cv_results": cv, "selection_policy": SELECTION_POLICY,
         "classification_threshold": CLASSIFICATION_THRESHOLD, "threshold_policy": "fixed_0.5_before_test",
         "test_metrics": test_metrics, "test_evaluation_count": 1,
-        "risk_bands": risk_review, "probability_calibrated": False,
+        "risk_bands": risk_review, "probability_calibrated": True, "probability_calibration": CALIBRATION,
+        "parameters": best["parameters"],
+        "refit": {"rows": len(training.y), "fit_seconds": fitted.fit_seconds,
+                  "convergence_warnings": fitted.convergence_warnings,
+                  "training_ids_sha256": _partition_digest(fitted.training_record_ids)},
+        "test_ids_sha256": _partition_digest(test.record_ids),
+        "curves_file": "test_curves.json",
         "credit_score_formula": "850 - 550 * payment_difficulty_probability (illustrative, not validated)",
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "pipeline_sha256": hashlib.sha256((destination / "credit_pipeline.joblib").read_bytes()).hexdigest(),
-        "libraries": {"sklearn": sklearn.__version__, "pandas": pd.__version__, "numpy": np.__version__, "xgboost": xgboost.__version__},
+        "pipeline_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+        "libraries": {"sklearn": sklearn.__version__, "pandas": pd.__version__, "numpy": np.__version__},
     }
+    if selected == "DecisionTree":
+        base = fitted.pipeline.calibrated_classifiers_[0].estimator
+        metadata["feature_importance"] = dict(zip(
+            base.named_steps["preprocess"].get_feature_names_out(),
+            base.named_steps["model"].feature_importances_.tolist(),
+        ))
     (destination / "model_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     return metadata
 
@@ -487,41 +476,41 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("prepare", "cv", "cv-smoke", "train"), default="prepare")
     parser.add_argument("--version", help="Required new version for --mode train; never activates automatically")
-    parser.add_argument("--artifact-root", type=Path, default=Path(os.environ.get("ARTIFACT_DIR", ROOT / "artifacts")))
+    parser.add_argument("--artifact-root", type=Path, default=Path(get_settings().artifact_dir))
     parser.add_argument("--application-csv")
     parser.add_argument("--description-csv")
     parser.add_argument("--data-dir")
     parser.add_argument("--sample-size", type=int, default=256, help="Preparation/CV-smoke sample size; real CV uses ALL Training")
     parser.add_argument("--report", type=Path, help="Optional preparation/CV/final-results JSON outside model artifact directories")
+    parser.add_argument("--quiet", action="store_true", help="Suppress final JSON on stdout")
     args = parser.parse_args()
     try:
-        if args.mode == "cv-smoke":
-            if args.application_csv or args.description_csv or args.data_dir:
-                raise ValueError("cv-smoke only uses artificial test data; CSV arguments are not accepted")
-            report = run_cv_smoke(args.sample_size)
-        else:
-            frame, dictionary, application_path, description_path = load_home_credit(
-                args.application_csv, args.description_csv, args.data_dir
+        frame, dictionary, application_path, description_path = load_home_credit(
+            args.application_csv, args.description_csv, args.data_dir, full_audit=args.mode == "prepare",
+        )
+        training, held_out = split_training_test(frame)
+        if args.mode == "train":
+            if not args.version:
+                raise ValueError("--mode train requires a new --version")
+            report = train_version(frame, args.version, args.artifact_root, partitions=(training, held_out))
+        elif args.mode == "cv":
+            report = compare_on_training(training)
+        elif args.mode == "cv-smoke":
+            sample, _ = train_test_split(
+                np.arange(len(training.y)), train_size=args.sample_size,
+                stratify=training.y, random_state=42,
             )
-            # The internal Test is held aside before any fit, even preprocessing smoke.
-            training, held_out = split_training_test(frame)
-            if args.mode == "train":
-                if not args.version:
-                    raise ValueError("--mode train requires a new --version")
-                report = train_version(frame, args.version, args.artifact_root, partitions=(training, held_out))
-            elif args.mode == "cv":
-                report = compare_on_training(training)
-                report["application_csv"] = str(application_path)
-                report["description_csv"] = str(description_path)
-            else:
-                report = audit_dataset(frame, dictionary, application_path, description_path)
-                training_frame = training.x.assign(**{TARGET: training.y})
-                report["pipeline_smoke"] = smoke_pipeline(training_frame, args.sample_size)
-            report["split"] = {
-                "training_rows": len(training.x), "held_out_rows": len(held_out.record_ids),
-                "test_size": 0.2, "stratify": TARGET, "random_state": 42,
-            }
-            report["test_evaluated"] = args.mode == "train"
+            small = TrainingData(training.x.iloc[sample], training.y.iloc[sample], training.record_ids[sample])
+            report = compare_on_training(small, profile="smoke")
+            report["dataset"] = DATASET + " (Training subset smoke check)"
+        else:
+            report = audit_dataset(frame, dictionary, application_path, description_path)
+            report["pipeline_smoke"] = smoke_pipeline(training.x.assign(**{TARGET: training.y}), args.sample_size)
+        report["split"] = {
+            **report.get("split", {}), "training_rows": len(training.x), "held_out_rows": len(held_out.y),
+            "test_size": 0.2, "stratify": TARGET, "random_state": 42,
+        }
+        report["test_evaluated"] = args.mode == "train"
         if args.report:
             # Do not let a preparation report overwrite the active model or metadata.
             report_path = args.report.resolve()
@@ -530,9 +519,10 @@ def main():
             report_path.parent.mkdir(parents=True, exist_ok=True)
             report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
         summary = {key: value for key, value in report.items() if key not in {"dictionary", "missing_by_column"}}
-        print(json.dumps(summary, indent=2, ensure_ascii=False))
+        if not args.quiet:
+            print(json.dumps(summary, indent=2, ensure_ascii=False))
     except (ValueError, OSError) as exc:
-        parser.exit(2, f"Home Credit preparation failed: {exc}\n")
+        parser.exit(2, f"Home Credit run failed: {exc}\n")
 
 
 if __name__ == "__main__":

@@ -151,12 +151,18 @@ def test_saved_customer_prediction_with_real_ml_api(client, monkeypatch):
     from app.services import ml_client
     monkeypatch.setattr(ml_client, "get_settings", lambda: SimpleNamespace(ml_service_url=os.environ["ML_INTEGRATION_URL"]))
     auth = headers(client)
-    created = client.post("/api/credit-cases", headers=auth, json={"display_name": "Live API fixture (test DB only)", "inputs": INPUTS})
+    active = client.get("/api/models/current", headers=auth)
+    assert active.status_code == 200, active.text
+    sample = client.get("/api/home-credit/sample", headers=auth)
+    assert sample.status_code == 200, sample.text
+    inputs = sample.json()
+    created = client.post("/api/credit-cases", headers=auth, json={"display_name": "Live API fixture (test DB only)", "inputs": inputs})
     assert created.status_code == 201, created.text
     case_id = created.json()["id"]
     response = client.post(f"/api/credit-cases/{case_id}/score", headers=auth, json={"expected_revision": 1})
     assert response.status_code == 201, response.text
-    assert response.json()["model_version"] == "home-credit-v1-20261108"
+    assert response.json()["model_version"] == active.json()["version"]
+    assert response.json()["algorithm"] == active.json()["algorithm"]
     history = client.get(f"/api/credit-cases/{case_id}/predictions", headers=auth).json()
     assert len(history) == 1 and history[0]["id"] == response.json()["id"]
-    assert history[0]["inputs_snapshot"] == INPUTS
+    assert history[0]["inputs_snapshot"] == inputs

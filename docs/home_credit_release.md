@@ -1,5 +1,7 @@
 # Home Credit v1 — kết quả thật và tích hợp dự đoán
 
+Tài liệu lịch sử của bản v1. Xem [báo cáo huấn luyện lại DT, Linear SVM và ANN](ml_retraining_report.md) để đối chiếu mô hình đang phục vụ.
+
 > **Cập nhật luồng sử dụng:** Theo yêu cầu tiếp theo, dữ liệu demo trong database đã được
 > sao lưu/xóa và thay bằng 307511 hồ sơ Home Credit. Dự đoán đã gắn hồ sơ, lưu snapshot
 > và lịch sử. Mô hình và kết quả CV/Test bên dưới không đổi. Xem

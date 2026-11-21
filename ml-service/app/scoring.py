@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from threading import Lock
 
 import joblib
 import numpy as np
@@ -13,8 +14,14 @@ from app.home_credit_features import (
 )
 from app.schemas import PredictRequest, PredictResponse
 
-_PIPELINE = None
-_METADATA: dict = {}
+_LOCK = Lock()
+_CACHE = None
+# Used only while the isolated activation process verifies its candidate API.
+_VERIFICATION_BUNDLE = None
+
+
+class ModelUnavailable(RuntimeError):
+    pass
 
 
 def load_bundle(directory: Path):
@@ -27,6 +34,8 @@ def load_bundle(directory: Path):
         raise ValueError("Model input types/units/missing-value contract does not match the API")
     if info.get("training_dataset") != DATASET or info.get("positive_class") != 1:
         raise ValueError("Model source or positive class does not match Home Credit")
+    if info.get("algorithm") not in {"DecisionTree", "LinearSVM", "ANN"} or not info.get("probability_calibrated"):
+        raise ValueError("Train and activate a calibrated DecisionTree, LinearSVM or ANN artifact")
     if hashlib.sha256(binary.read_bytes()).hexdigest() != info.get("pipeline_sha256"):
         raise ValueError("Pipeline checksum mismatch")
     pipeline = joblib.load(binary)
@@ -35,22 +44,27 @@ def load_bundle(directory: Path):
     return pipeline, info
 
 
-def _ensure_loaded():
-    global _PIPELINE, _METADATA
-    if _PIPELINE is None:
-        settings = get_settings()
-        root = Path(settings.artifact_dir)
-        pointer = root / "active_model.json"
-        if not pointer.is_file():
-            raise FileNotFoundError("No validated active Home Credit model. Run training.activate after version training; never retrain at startup.")
-        active = json.loads(pointer.read_text(encoding="utf-8"))
-        directory = (root / active["relative_dir"]).resolve()
-        if not directory.is_relative_to(root.resolve() / "versions"):
-            raise ValueError("Active model must be inside artifacts/versions")
-        pipeline, info = load_bundle(directory)
-        if info["version"] != active["version"]:
-            raise ValueError("Active model version mismatch")
-        _PIPELINE, _METADATA = pipeline, info
+def _active_bundle():
+    global _CACHE
+    if _VERIFICATION_BUNDLE is not None:
+        return _VERIFICATION_BUNDLE
+    root = Path(get_settings().artifact_dir).resolve()
+    try:
+        with _LOCK:
+            raw = (root / "active_model.json").read_bytes()
+            key = (root, raw)
+            if _CACHE is None or _CACHE[0] != key:
+                active = json.loads(raw)
+                directory = (root / active["relative_dir"]).resolve()
+                if not directory.is_relative_to(root / "versions"):
+                    raise ValueError("Active model must be inside artifacts/versions")
+                pipeline, info = load_bundle(directory)
+                if info["version"] != active["version"]:
+                    raise ValueError("Active model version mismatch")
+                _CACHE = (key, (pipeline, info, directory))
+            return _CACHE[1]
+    except (OSError, ValueError, KeyError, ImportError) as exc:
+        raise ModelUnavailable("No usable trained Home Credit model. Train and activate a new version.") from exc
 
 
 def request_to_frame(payload: PredictRequest):
@@ -58,36 +72,35 @@ def request_to_frame(payload: PredictRequest):
 
 
 def predict(payload: PredictRequest) -> PredictResponse:
-    _ensure_loaded()
+    pipeline, info, _ = _active_bundle()
     frame = request_to_frame(payload)
-    probability = float(_PIPELINE.predict_proba(frame)[0, 1])
+    probability = float(pipeline.predict_proba(frame)[0, 1])
     if not np.isfinite(probability) or not 0 <= probability <= 1:
         raise ValueError("Model returned an invalid probability")
-    cleaned = _PIPELINE.named_steps["preprocess"].named_steps["clean"].transform(frame)
+    cleaned = pipeline.calibrated_classifiers_[0].estimator.named_steps["preprocess"].named_steps["clean"].transform(frame)
     missing = cleaned.columns[cleaned.isna().iloc[0]].tolist()
     return PredictResponse(
         payment_difficulty_probability=probability,
         other_outcome_probability=1 - probability,
-        predicted_payment_difficulty=probability >= _METADATA["classification_threshold"],
-        classification_threshold=_METADATA["classification_threshold"],
+        predicted_payment_difficulty=probability >= info["classification_threshold"],
+        classification_threshold=info["classification_threshold"],
         # Legacy risk-band defaults are deliberately not applied to Home Credit.
         risk_level="NOT_VALIDATED", risk_bands_validated=False,
         credit_score=round(max(300, min(850, 850 - 550 * probability)), 2),
-        model_version=_METADATA["version"], algorithm=_METADATA["algorithm"],
-        data_source=_METADATA["training_dataset"], outcome_definition=TARGET_MEANING["1"],
-        imputed_features=missing,
+        model_version=info["version"], algorithm=info["algorithm"],
+        data_source=info["training_dataset"], outcome_definition=TARGET_MEANING["1"],
+        imputed_features=missing, probability_calibrated=info["probability_calibrated"],
     )
 
 
 def metadata() -> dict:
-    _ensure_loaded()
-    return _METADATA
+    return _active_bundle()[1]
 
 
 def input_contract() -> dict:
-    _ensure_loaded()
+    pipeline, _, _ = _active_bundle()
     specs = {name: dict(spec) for name, spec in FEATURE_SPEC.items()}
-    encoder = _PIPELINE.named_steps["preprocess"].named_steps["columns"].named_transformers_["cat"].named_steps["encoder"]
+    encoder = pipeline.calibrated_classifiers_[0].estimator.named_steps["preprocess"].named_steps["columns"].named_transformers_["cat"].named_steps["encoder"]
     specs["OCCUPATION_TYPE"]["choices"] = [value for value in encoder.categories_[1].tolist() if value != "__MISSING__"]
     return {
         "contract_version": CONTRACT_VERSION, "features": specs,
@@ -97,8 +110,17 @@ def input_contract() -> dict:
 
 
 def sample_request() -> dict:
-    _ensure_loaded()
-    root = Path(get_settings().artifact_dir)
-    # Use the version actually loaded by this worker; activation requires restart.
-    sample = json.loads((root / "versions" / _METADATA["version"] / "sample_request.json").read_text(encoding="utf-8"))
+    _, _, directory = _active_bundle()
+    sample = json.loads((directory / "sample_request.json").read_text(encoding="utf-8"))
     return PredictRequest.model_validate(sample).model_dump()
+
+
+def test_curves() -> dict:
+    _, info, directory = _active_bundle()
+    data = json.loads((directory / "test_curves.json").read_text(encoding="utf-8"))
+    display = {}
+    for name, curve in data.items():
+        length = len(next(iter(curve.values())))
+        indices = np.linspace(0, length - 1, min(length, 400), dtype=int)
+        display[name] = {axis: [values[i] for i in indices] for axis, values in curve.items()}
+    return {"version": info["version"], **display}

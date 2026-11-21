@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     jwt_access_token_expire_minutes: int = 480
     cors_origins: str = "http://localhost:3000,http://localhost:5173"
     ml_service_url: str = "http://localhost:8001"
+    ml_training_token: str = ""
     seed_on_startup: bool = True
 
     admin_email: str = "admin@credit-risk.com"

@@ -11,7 +11,7 @@ Hệ thống hỗ trợ đánh giá rủi ro tín dụng theo mô hình 3 dịch
                                     ▼
                              ┌──────────────┐
                              │  ML Service  │
-                             │ FastAPI+SHAP │
+                             │ sklearn API  │
                              └──────────────┘
 ```
 
@@ -22,9 +22,10 @@ Hệ thống hỗ trợ đánh giá rủi ro tín dụng theo mô hình 3 dịch
   đè lịch sử mô phỏng. API cũ yêu cầu bổ sung đầu vào thay vì suy giá trị không tương đương.
 - ML Service nhận 6 đặc trưng Home Credit theo hợp đồng chung, trả ước lượng khó khăn
   thanh toán, nguồn và phiên bản. Không dùng heuristic SHAP cũ cho dữ liệu mới.
-- Manifest active_model.json chỉ được cập nhật sau kiểm tra reload/API. CV chọn AP trên
-  Training, refit toàn Training, đánh giá Test độc lập một lần; xem [bản phát hành](home_credit_release.md).
-- Điểm tín dụng là **mô phỏng**: `850 - 550 * P(default)`.
+- ML Service cập nhật `active_model.json` sau khi tải lại và xác minh dự đoán. Chọn theo
+  mean AP của 5 fold Training, fit lại toàn bộ Training và đánh giá Test độc lập một lần.
+  [Báo cáo huấn luyện lại](ml_retraining_report.md).
+- Điểm hồ sơ minh họa được tính theo `850 - 550 * P(TARGET=1)`.
 - Hệ thống **không** phê duyệt/từ chối khoản vay thật.
 
 ## Vai trò
@@ -38,5 +39,5 @@ Hệ thống hỗ trợ đánh giá rủi ro tín dụng theo mô hình 3 dịch
 
 - `frontend/`: giao diện tiếng Việt, Axios, Recharts.
 - `backend/`: REST API, SQLAlchemy, JWT, httpx → ML.
-- `ml-service/`: pipeline joblib, XGBoost/RF/LR, SHAP.
+- `ml-service/`: pipeline Joblib, Decision Tree, Linear SVM, ANN và hiệu chỉnh sigmoid trên Training.
 - `database/`: schema SQL, seed, CSV mẫu.

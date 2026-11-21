@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.core.exceptions import AppError
+from app.routers import models
 from app.services import ml_client
 from tests.conftest import login
 from app.core.security import create_access_token
@@ -15,6 +16,21 @@ def test_legacy_loans_require_new_real_inputs():
         ml_client.build_ml_payload(SimpleNamespace(), SimpleNamespace())
     assert error.value.status_code == 422
     assert error.value.code == "HOME_CREDIT_INPUT_REQUIRED"
+
+
+def test_admin_training_forwards_internal_token(client, monkeypatch):
+    monkeypatch.setattr(models, "get_settings", lambda: SimpleNamespace(ml_training_token="test-token"))
+
+    def submit(method, path, *, headers):
+        assert (method, path, headers) == ("POST", "/training", {"X-ML-Training-Token": "test-token"})
+        return {"status": "running"}
+
+    monkeypatch.setattr(models, "request_home_credit", submit)
+    assert client.post("/api/models/training").status_code == 401
+    token = login(client, "admin@test.com", "Admin@123456")
+    response = client.post("/api/models/training", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 202
+    assert response.json()["status"] == "running"
 
 
 @pytest.mark.skipif(not os.environ.get("ML_INTEGRATION_URL"), reason="Start the versioned ML API and set ML_INTEGRATION_URL")
@@ -31,7 +47,14 @@ def test_live_backend_home_credit_bridge(client, monkeypatch):
     result = response.json()
     assert result["data_source"].startswith("Home Credit")
     assert result["risk_level"] == "NOT_VALIDATED"
+    assert result["probability_calibrated"]
     assert client.get("/api/models/current", headers=headers).json()["version"] == result["model_version"]
+    curves = client.get("/api/models/current/curves", headers=headers).json()
+    assert curves["version"] == result["model_version"]
+    assert len(curves["pr"]["recall"]) == len(curves["pr"]["precision"]) > 1
+    assert len(curves["roc"]["fpr"]) == len(curves["roc"]["tpr"]) > 1
+    assert client.get("/api/models/training", headers=headers).status_code == 200
+    assert client.post("/api/models/training", headers=headers).status_code == 403
     assert client.post("/api/home-credit/predict", headers=headers, json={"monthly_income": 10000000}).status_code == 422
     assert client.post("/api/home-credit/predict", headers=headers, json={**sample, "TARGET": 1}).status_code == 422
     assert client.post("/api/home-credit/predict", json=sample).status_code == 401

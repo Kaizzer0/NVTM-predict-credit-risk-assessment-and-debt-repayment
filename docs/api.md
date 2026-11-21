@@ -42,6 +42,10 @@ Tất cả API trừ `/api/auth/register`, `/api/auth/login`, `/health` yêu c�
 
 - `GET /api/dashboard/summary`
 - `GET /api/models/current` — metadata phiên bản thực sự được ML Service phục vụ (manifest), gồm CV và Test độc lập.
+- `GET /api/models/current/curves` — tọa độ PR và ROC trên Test, cùng phiên bản mô hình.
+- `GET /api/models/training` — trạng thái, phiên bản và số fold đã đánh giá trong phiên dịch vụ.
+- `POST /api/models/training` — ADMIN, trả 202 khi nhận tác vụ và 409 nếu đang huấn luyện.
+  Cần cấu hình `ML_TRAINING_TOKEN` giống nhau ở backend và ML Service.
 - `GET /api/models` — registry lịch sử trong database; trạng thái đã lưu không quyết định manifest đang phục vụ.
 - `GET /health`
 
@@ -53,15 +57,16 @@ Tất cả API trừ `/api/auth/register`, `/api/auth/login`, `/health` yêu c�
 
 ## Mã lỗi
 
-400 validation nghiệp vụ · 401 chưa đăng nhập · 403 sai vai trò · 404 không tìm thấy · 422 Pydantic · 500 lỗi hệ thống/ML.
+400 validation nghiệp vụ · 401 chưa đăng nhập · 403 sai vai trò · 404 không tìm thấy · 409 xung đột · 422 Pydantic · 503 chưa có artifact phục vụ hoặc ML không sẵn sàng.
 
 ## ML Service (chỉ Backend gọi)
 
 - `POST http://localhost:8001/predict`
-- `GET /health`
+- `GET /health` — kiểm tra tiến trình và cờ `model_ready`.
 - `GET /model/info`
 - `GET /model/input-schema` — định nghĩa kiểu/đơn vị/nullability dùng chung cho giao diện.
 - `GET /model/sample` — một dòng Training chỉ có đặc trưng và xác nhận đơn vị, không có TARGET/ID.
+- `GET /model/curves` — đường PR/ROC của phiên bản đang phục vụ.
 
 ## Home Credit (luồng mới)
 
@@ -89,7 +94,7 @@ Home Credit, không mặc định VND, không suy kỳ thu nhập. Cột thừa,
 số tiền không dương và ngày dương không hợp lệ đều bị từ chối.
 
 Phản hồi: `payment_difficulty_probability`, `other_outcome_probability`, lớp tại
-`classification_threshold=0.5`, `data_source`, `model_version`, `imputed_features` và
+`classification_threshold=0.5`, `probability_calibrated`, `data_source`, `model_version`, `imputed_features` và
 điểm hồ sơ minh họa. Không gọi `1-p` là khả năng trả nợ đầy đủ. `risk_level=NOT_VALIDATED`
 và `risk_bands_validated=false`; không dùng ngưỡng synthetic 0,20/0,45. SHAP chưa triển
 khai cho hợp đồng mới nên trả danh sách rỗng kèm giải thích, không dùng heuristic giả.

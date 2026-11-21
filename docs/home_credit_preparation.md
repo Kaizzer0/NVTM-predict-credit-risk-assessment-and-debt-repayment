@@ -1,5 +1,7 @@
 # Chuẩn bị dữ liệu Home Credit Default Risk
 
+Tài liệu chuẩn bị của bản v1. Xem [báo cáo huấn luyện lại](ml_retraining_report.md) để lấy số liệu audit và hướng dẫn hiện hành.
+
 > Kết quả chuẩn bị dưới đây là lịch sử Prompt 1. Trạng thái phục vụ hiện tại và kết
 > quả thật ở Prompt 3: [Home Credit release](home_credit_release.md).
 

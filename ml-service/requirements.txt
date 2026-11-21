@@ -5,7 +5,7 @@ pydantic-settings==2.7.0
 pandas==2.2.3
 numpy==2.2.1
 scikit-learn==1.6.0
-xgboost==2.1.4
+threadpoolctl==3.8.0
 joblib==1.4.2
 # Active Home Credit API does not generate SHAP or plots. Historical results stay unchanged.
 pytest==8.3.4

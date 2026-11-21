@@ -1,5 +1,7 @@
 # Khách hàng → hồ sơ Home Credit → dự đoán → lịch sử
 
+Các số liệu và kết quả dự đoán mẫu bên dưới thuộc bản v1. Xem [báo cáo huấn luyện lại](ml_retraining_report.md) để đối chiếu phiên bản hiện hành.
+
 ## Trạng thái đã thực hiện trên Docker
 
 - Đã import **307511** dòng thật từ `application_train.csv`, SHA256

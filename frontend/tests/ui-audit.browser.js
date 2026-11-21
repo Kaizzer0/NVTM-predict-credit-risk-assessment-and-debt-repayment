@@ -1,6 +1,7 @@
 async (page) => {
   page.setDefaultTimeout(7000);
-  await page.unroute("**/api/**");
+  const apiPattern = "http://localhost:8000/api/**";
+  await page.unroute(apiPattern);
   await (async (page) => {
   const state = { counts: {}, requests: [], role: "ADMIN", failures: new Set(), empty: false, delay: 0 };
   page.__uiAudit = state;
@@ -8,7 +9,7 @@ async (page) => {
   const prediction = { id: 12, case_id: 1, input_revision: 1, display_name: "Khách hàng HC 100001", inputs_snapshot: inputs, model_version: "home-credit-v1", algorithm: "Logistic Regression", data_source: "Home Credit", payment_difficulty_probability: .126, predicted_payment_difficulty: false, classification_threshold: .5, risk_level: "", credit_score: 780.7, created_at: "2026-11-08T08:00:00Z", response_json: { imputed_features: [], disclaimer: "", explanation_note: "" } };
   const record = { id: 1, source_application_id: 100001, display_name: "Khách hàng HC 100001", source: "Home Credit", inputs_json: inputs, input_revision: 1, reference_target: 0, created_at: prediction.created_at, updated_at: prediction.created_at, latest_prediction: prediction };
   state.record = record; state.prediction = prediction;
-  await page.route("**/api/**", async route => {
+  await page.route(apiPattern, async route => {
     const req = route.request(), url = new URL(req.url()), path = url.pathname;
     state.counts[path] = (state.counts[path] || 0) + 1;
     state.requests.push({ path, method: req.method(), body: req.postDataJSON(), query: url.search });
@@ -36,7 +37,8 @@ async (page) => {
     else if (path === "/api/credit-cases") body = req.method()==="POST"?record:{items:state.empty?[]:[{...record,display_name:url.searchParams.get("q")||record.display_name}],total:state.empty?0:25,page:Number(url.searchParams.get("page")||1),page_size:10};
     else if (path === "/api/users") body = req.method()==="POST"?user:{items:state.empty?[]:[user,{...user,id:2,full_name:"Trần Quốc Bảo",email:"officer@credit-risk.com",role:"OFFICER"}],total:state.empty?0:12,page:1,page_size:8};
     else if (/^\/api\/users\/\d+$/.test(path)) body = user;
-    else if(path === "/api/models/current") body = {version:"home-credit-v1",algorithm:"Logistic Regression",training_dataset:"Home Credit",selection_policy:"AP",classification_threshold:.5,credit_score_formula:"850 - 550 * P(TARGET=1)",risk_bands:{status:"unvalidated"},cv_results:{models:{"Logistic Regression":{summary:{ap_mean:.245,ap_std:.012,roc_auc_mean:.751,roc_auc_std:.009}}}},test_metrics:{average_precision:.241,roc_auc:.75}};
+    else if(path === "/api/models/current") return route.fulfill({status:503,json:{detail:"Chưa có mô hình"},headers:{"access-control-allow-origin":"*"}});
+    else if(path === "/api/models/training") body = {status:"idle",enabled:false,message:null,version:null,completed_folds:0};
     else if(path === "/api/models") body = state.empty?[]:[{id:1,model_name:"Home Credit",version:"v1",algorithm:"Logistic Regression",training_dataset:"Home Credit",status:"ACTIVE",created_at:prediction.created_at}];
     else body = {};
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body), headers:{"access-control-allow-origin":"*"} });
@@ -83,6 +85,7 @@ async (page) => {
   await page.getByRole("dialog").getByRole("link",{name:"Khách hàng",exact:true}).click();
   await page.waitForURL("**/customers");
   check(await page.locator("dialog").evaluate(d=>!d.open),"drawer closes on navigation");
+  await page.waitForFunction(()=>document.activeElement.id==="main-content");
   check(await page.evaluate(()=>document.activeElement.id==="main-content"),"navigation focuses main");
   await page.getByRole("button",{name:"Sau →",exact:true}).click();
   await page.getByRole("navigation",{name:"Phân trang"}).getByText("2",{exact:true}).waitFor();
@@ -167,7 +170,8 @@ async (page) => {
   state.empty=true;
   for(const path of ["/customers","/predictions","/users","/models"]) {
     await page.goto("http://localhost:5173"+path);
-    await page.getByRole("status").filter({hasText:/Chưa có/}).waitFor();
+    if (path === "/models") await page.getByText("Chưa có phiên bản trong registry.", {exact:true}).waitFor();
+    else await page.getByRole("status").filter({hasText:/Chưa có/}).waitFor();
     check(true,"empty "+path);
   }
   await page.goto("http://localhost:5173/customers");

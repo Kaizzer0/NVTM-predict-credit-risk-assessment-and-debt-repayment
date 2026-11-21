@@ -52,8 +52,10 @@ export function CasePredictionCard({
         </p>
       </div>
       <p className="text-sm text-muted">
-        Không phải bảo đảm trả nợ hoặc xác suất vỡ nợ đã hiệu chỉnh. Nhóm
-        thấp/trung bình/cao chưa được xác nhận.
+        {prediction.response_json.probability_calibrated
+          ? "Xác suất TARGET=1 đã được hiệu chỉnh trên Training."
+          : "Bản ghi lưu chưa có xác suất TARGET=1 đã hiệu chỉnh."}{" "}
+        Nhóm thấp/trung bình/cao chưa được xác nhận.
       </p>
       <dl className="detail-grid">
         <div>
