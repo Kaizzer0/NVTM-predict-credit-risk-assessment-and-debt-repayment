@@ -1,7 +1,7 @@
 // Playwright runCode function. Use with the running local test stack and demo accounts.
 async (page) => {
   const base = "http://localhost:5173";
-  const api = "http://localhost:8000";
+  const api = "http://127.0.0.1:8000";
   const checks = [];
   const failedRequests = [];
   const pageErrors = [];

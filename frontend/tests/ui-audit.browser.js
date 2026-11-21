@@ -1,6 +1,6 @@
 async (page) => {
   page.setDefaultTimeout(7000);
-  const apiPattern = "http://localhost:8000/api/**";
+  const apiPattern = "http://127.0.0.1:8000/api/**";
   await page.unroute(apiPattern);
   await (async (page) => {
   const state = { counts: {}, requests: [], role: "ADMIN", failures: new Set(), empty: false, delay: 0 };

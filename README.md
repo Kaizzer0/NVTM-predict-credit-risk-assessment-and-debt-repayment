@@ -121,6 +121,10 @@ npm run dev
 # Mở trình duyệt tại http://localhost:5173
 ```
 
+Frontend Vite gọi backend local tại `http://127.0.0.1:8000`. Backend local gọi ML
+Service tại `http://127.0.0.1:8001`. Nếu Docker hoặc WSL cũng đang phục vụ các
+cổng này, dùng địa chỉ IPv4 trên để kiểm tra đúng dịch vụ local.
+
 ---
 
 ## 6. Chạy kiểm thử tự động (Pytest)

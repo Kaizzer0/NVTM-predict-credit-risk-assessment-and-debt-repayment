@@ -10,8 +10,8 @@ class Settings(BaseSettings):
     jwt_secret_key: str = "change-this-demo-secret-key-not-for-production"
     jwt_algorithm: str = "HS256"
     jwt_access_token_expire_minutes: int = 480
-    cors_origins: str = "http://localhost:3000,http://localhost:5173"
-    ml_service_url: str = "http://localhost:8001"
+    cors_origins: str = "http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000,http://127.0.0.1:5173"
+    ml_service_url: str = "http://127.0.0.1:8001"
     ml_training_token: str = ""
     seed_on_startup: bool = True
 
